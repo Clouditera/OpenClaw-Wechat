@@ -8,13 +8,21 @@ import { existsSync, appendFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
+import {
+  sha1,
+  computeMsgSignature,
+  decodeAesKey,
+  pkcs7Unpad,
+  decryptWecom,
+  parseIncomingXml,
+  requireEnv,
+  asNumber,
+  getByteLength,
+  markdownToWecomText,
+  splitWecomText,
+} from "./utils.js";
 
 const execFileAsync = promisify(execFile);
-const xmlParser = new XMLParser({
-  ignoreAttributes: false,
-  trimValues: true,
-  processEntities: false, // 禁用实体处理，防止 XXE 攻击
-});
 const xmlBuilder = new XMLBuilder({ ignoreAttributes: false });
 
 // 请求体大小限制 (1MB)
@@ -40,68 +48,11 @@ function readRequestBody(req, maxSize = MAX_REQUEST_BODY_SIZE) {
   });
 }
 
-function sha1(text) {
-  return crypto.createHash("sha1").update(text).digest("hex");
-}
-
-function computeMsgSignature({ token, timestamp, nonce, encrypt }) {
-  const arr = [token, timestamp, nonce, encrypt].map(String).sort();
-  return sha1(arr.join(""));
-}
-
-function decodeAesKey(aesKey) {
-  const base64 = aesKey.endsWith("=") ? aesKey : `${aesKey}=`;
-  return Buffer.from(base64, "base64");
-}
-
-function pkcs7Unpad(buf) {
-  const pad = buf[buf.length - 1];
-  if (pad < 1 || pad > 32) return buf;
-  return buf.subarray(0, buf.length - pad);
-}
-
-function decryptWecom({ aesKey, cipherTextBase64 }) {
-  const key = decodeAesKey(aesKey);
-  const iv = key.subarray(0, 16);
-  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
-  decipher.setAutoPadding(false);
-  const plain = Buffer.concat([
-    decipher.update(Buffer.from(cipherTextBase64, "base64")),
-    decipher.final(),
-  ]);
-  const unpadded = pkcs7Unpad(plain);
-
-  const msgLen = unpadded.readUInt32BE(16);
-  const msgStart = 20;
-  const msgEnd = msgStart + msgLen;
-  const msg = unpadded.subarray(msgStart, msgEnd).toString("utf8");
-  const corpId = unpadded.subarray(msgEnd).toString("utf8");
-  return { msg, corpId };
-}
-
-function parseIncomingXml(xml) {
-  const obj = xmlParser.parse(xml);
-  const root = obj?.xml ?? obj;
-  return root;
-}
-
-function requireEnv(name, fallback) {
-  const v = process.env[name];
-  if (v == null || v === "") return fallback;
-  return v;
-}
-
-function asNumber(v, fallback = null) {
-  if (v == null) return fallback;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-
 // 企业微信 access_token 缓存（支持多账户）
 const accessTokenCaches = new Map(); // key: corpId, value: { token, expiresAt, refreshPromise }
 
-async function getWecomAccessToken({ corpId, corpSecret }) {
-  const cacheKey = corpId;
+async function getWecomAccessToken({ corpId, corpSecret, cacheKey: customCacheKey }) {
+  const cacheKey = customCacheKey || corpId;
   let cache = accessTokenCaches.get(cacheKey);
 
   if (!cache) {
@@ -138,63 +89,6 @@ async function getWecomAccessToken({ corpId, corpSecret }) {
   })();
 
   return cache.refreshPromise;
-}
-
-// Markdown 转换为企业微信纯文本
-// 企业微信不支持 Markdown 渲染，需要转换为可读的纯文本格式
-function markdownToWecomText(markdown) {
-  if (!markdown) return markdown;
-
-  let text = markdown;
-
-  // 移除代码块标记，保留内容并添加缩进
-  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (match, lang, code) => {
-    const lines = code.trim().split('\n').map(line => '  ' + line).join('\n');
-    return lang ? `[${lang}]\n${lines}` : lines;
-  });
-
-  // 移除行内代码标记
-  text = text.replace(/`([^`]+)`/g, '$1');
-
-  // 转换标题为带符号的格式
-  text = text.replace(/^### (.+)$/gm, '▸ $1');
-  text = text.replace(/^## (.+)$/gm, '■ $1');
-  text = text.replace(/^# (.+)$/gm, '◆ $1');
-
-  // 移除粗体/斜体标记，保留内容
-  text = text.replace(/\*\*\*([^*]+)\*\*\*/g, '$1');
-  text = text.replace(/\*\*([^*]+)\*\*/g, '$1');
-  text = text.replace(/\*([^*]+)\*/g, '$1');
-  text = text.replace(/___([^_]+)___/g, '$1');
-  text = text.replace(/__([^_]+)__/g, '$1');
-  text = text.replace(/_([^_]+)_/g, '$1');
-
-  // 转换链接为 "文字 (URL)" 格式
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
-
-  // 转换无序列表标记
-  text = text.replace(/^[\*\-] /gm, '• ');
-
-  // 转换有序列表（保持原样，数字已经可读）
-
-  // 转换水平线
-  text = text.replace(/^[-*_]{3,}$/gm, '────────────');
-
-  // 移除图片标记，保留 alt 文字
-  text = text.replace(/!\[([^\]]*)\]\([^)]+\)/g, '[图片: $1]');
-
-  // 清理多余空行（保留最多两个连续换行）
-  text = text.replace(/\n{3,}/g, '\n\n');
-
-  return text.trim();
-}
-
-// 企业微信文本消息限制 (2048 字节，中文约 680 字)
-const WECOM_TEXT_BYTE_LIMIT = 2000; // 留点余量
-
-// 计算字符串的 UTF-8 字节长度
-function getByteLength(str) {
-  return Buffer.byteLength(str, 'utf8');
 }
 
 function sleep(ms) {
@@ -254,64 +148,6 @@ const apiLimiter = new RateLimiter({ maxConcurrent: 3, minInterval: 200 });
 // 消息处理限流器（最多5并发）
 const messageProcessLimiter = new RateLimiter({ maxConcurrent: 5, minInterval: 0 });
 
-// 消息分段函数，按字节限制分割（企业微信限制 2048 字节）
-function splitWecomText(text, byteLimit = WECOM_TEXT_BYTE_LIMIT) {
-  if (getByteLength(text) <= byteLimit) return [text];
-
-  const chunks = [];
-  let remaining = text;
-
-  while (remaining.length > 0) {
-    if (getByteLength(remaining) <= byteLimit) {
-      chunks.push(remaining);
-      break;
-    }
-
-    // 二分查找合适的分割点（按字节）
-    let low = 1;
-    let high = remaining.length;
-
-    while (low < high) {
-      const mid = Math.floor((low + high + 1) / 2);
-      if (getByteLength(remaining.slice(0, mid)) <= byteLimit) {
-        low = mid;
-      } else {
-        high = mid - 1;
-      }
-    }
-    let splitIndex = low;
-
-    // 尝试在自然断点处分割（往前找 200 字符范围内）
-    const searchStart = Math.max(0, splitIndex - 200);
-    const searchText = remaining.slice(searchStart, splitIndex);
-
-    // 优先在段落处分割
-    let naturalBreak = searchText.lastIndexOf("\n\n");
-    if (naturalBreak === -1) {
-      // 其次在换行处
-      naturalBreak = searchText.lastIndexOf("\n");
-    }
-    if (naturalBreak === -1) {
-      // 再次在句号处
-      naturalBreak = searchText.lastIndexOf("。");
-      if (naturalBreak !== -1) naturalBreak += 1; // 包含句号
-    }
-    if (naturalBreak !== -1 && naturalBreak > 0) {
-      splitIndex = searchStart + naturalBreak;
-    }
-
-    // 确保至少分割一些内容
-    if (splitIndex <= 0) {
-      splitIndex = Math.min(remaining.length, Math.floor(byteLimit / 3));
-    }
-
-    chunks.push(remaining.slice(0, splitIndex).trim());
-    remaining = remaining.slice(splitIndex).trim();
-  }
-
-  return chunks.filter(c => c.length > 0);
-}
-
 // 发送单条文本消息（内部函数，带限流）
 async function sendWecomTextSingle({ corpId, corpSecret, agentId, toUser, text }) {
   return apiLimiter.execute(async () => {
@@ -355,8 +191,8 @@ async function sendWecomText({ corpId, corpSecret, agentId, toUser, text, logger
 }
 
 // 上传临时素材到企业微信
-async function uploadWecomMedia({ corpId, corpSecret, type, buffer, filename }) {
-  const accessToken = await getWecomAccessToken({ corpId, corpSecret });
+async function uploadWecomMedia({ corpId, corpSecret, type, buffer, filename, cacheKey }) {
+  const accessToken = await getWecomAccessToken({ corpId, corpSecret, cacheKey });
   const uploadUrl = `https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=${encodeURIComponent(accessToken)}&type=${encodeURIComponent(type)}`;
 
   // 构建 multipart/form-data
@@ -483,9 +319,9 @@ const WecomChannelPlugin = {
   meta: {
     id: "wecom",
     label: "WeCom",
-    selectionLabel: "WeCom (企业微信自建应用)",
+    selectionLabel: "WeCom (企业微信自建应用 + 微信客服)",
     docsPath: "/channels/wecom",
-    blurb: "Enterprise WeChat internal app via callback + send API.",
+    blurb: "Enterprise WeChat internal app + customer service via callback + send API.",
     aliases: ["wework", "qiwei", "wxwork"],
   },
   capabilities: {
@@ -521,6 +357,33 @@ const WecomChannelPlugin = {
   inbound: {
     // 当消息需要回复时，clawdbot 会调用这个方法
     deliverReply: async ({ to, text, accountId, mediaUrl, mediaType }) => {
+      // 检测 KF 会话（to 格式: wecom-kf:openKfId:externalUserId）
+      if (to.startsWith("wecom-kf:")) {
+        const parts = to.split(":");
+        const openKfId = parts[1];
+        const externalUserId = parts.slice(2).join(":");
+        const kfConfig = getWecomKfConfig();
+        if (!kfConfig) throw new Error("WeCom KF not configured");
+        const { corpId, kfSecret } = kfConfig;
+
+        if (mediaUrl && mediaType === "image") {
+          try {
+            const { buffer } = await fetchMediaFromUrl(mediaUrl);
+            const mediaId = await uploadWecomMedia({ corpId, corpSecret: kfSecret, type: "image", buffer, filename: "image.jpg", cacheKey: `${corpId}:kf` });
+            await sendKfImage({ corpId, kfSecret, openKfId, toUser: externalUserId, mediaId });
+          } catch (mediaErr) {
+            console.warn?.(`wecom-kf: failed to send media: ${mediaErr.message}`);
+          }
+        }
+
+        if (text) {
+          await sendKfText({ corpId, kfSecret, openKfId, toUser: externalUserId, text });
+        }
+
+        return { ok: true };
+      }
+
+      // 原有应用消息逻辑
       const config = getWecomConfig();
       if (!config?.corpId || !config?.corpSecret || !config?.agentId) {
         throw new Error("WeCom not configured (check channels.wecom in clawdbot.json)");
@@ -763,6 +626,436 @@ function listWecomAccountIds(api) {
   return Array.from(accountIds);
 }
 
+// ============================================================
+// 微信客服 (Customer Service) API 支持
+// ============================================================
+
+// KF 配置缓存
+const wecomKfConfigs = new Map();
+
+function getWecomKfConfig(api) {
+  if (wecomKfConfigs.has("default")) {
+    return wecomKfConfigs.get("default");
+  }
+
+  const cfg = api?.config ?? gatewayRuntime?.config;
+  const wecomConfig = cfg?.channels?.wecom;
+  const kfConfig = wecomConfig?.kf;
+
+  // corpId 共享自父级 wecom 配置
+  const corpId = wecomConfig?.corpId
+    || cfg?.env?.vars?.WECOM_CORP_ID
+    || requireEnv("WECOM_CORP_ID");
+
+  const kfSecret = kfConfig?.kfSecret
+    || cfg?.env?.vars?.WECOM_KF_SECRET
+    || requireEnv("WECOM_KF_SECRET");
+
+  const openKfId = kfConfig?.openKfId
+    || cfg?.env?.vars?.WECOM_KF_OPEN_KFID
+    || requireEnv("WECOM_KF_OPEN_KFID");
+
+  const webhookPath = kfConfig?.webhookPath
+    || cfg?.env?.vars?.WECOM_KF_WEBHOOK_PATH
+    || "/wecom/kf/callback";
+
+  const enabled = kfConfig?.enabled !== false;
+
+  if (corpId && kfSecret && openKfId) {
+    const config = { corpId, kfSecret, openKfId, webhookPath, enabled };
+    wecomKfConfigs.set("default", config);
+    return config;
+  }
+
+  return null;
+}
+
+// KF 通用消息发送
+async function sendKfMessage({ corpId, kfSecret, openKfId, toUser, msgtype, content, logger }) {
+  return apiLimiter.execute(async () => {
+    const accessToken = await getWecomAccessToken({
+      corpId,
+      corpSecret: kfSecret,
+      cacheKey: `${corpId}:kf`,
+    });
+
+    const url = `https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token=${encodeURIComponent(accessToken)}`;
+    const body = {
+      touser: toUser,
+      open_kfid: openKfId,
+      msgid: randomUUID(),
+      msgtype,
+      ...content,
+    };
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    const json = await res.json();
+    if (json.errcode !== 0) {
+      throw new Error(`KF send_msg failed: ${JSON.stringify(json)}`);
+    }
+    return json;
+  });
+}
+
+// KF 文本发送（支持自动分段）
+async function sendKfText({ corpId, kfSecret, openKfId, toUser, text, logger }) {
+  const chunks = splitWecomText(text);
+  logger?.info?.(`wecom-kf: splitting message into ${chunks.length} chunks`);
+
+  for (let i = 0; i < chunks.length; i++) {
+    await sendKfMessage({
+      corpId, kfSecret, openKfId, toUser,
+      msgtype: "text",
+      content: { text: { content: chunks[i] } },
+      logger,
+    });
+    if (i < chunks.length - 1) await sleep(300);
+  }
+}
+
+// KF 图片发送
+async function sendKfImage({ corpId, kfSecret, openKfId, toUser, mediaId }) {
+  return sendKfMessage({
+    corpId, kfSecret, openKfId, toUser,
+    msgtype: "image",
+    content: { image: { media_id: mediaId } },
+  });
+}
+
+// KF 语音发送
+async function sendKfVoice({ corpId, kfSecret, openKfId, toUser, mediaId }) {
+  return sendKfMessage({
+    corpId, kfSecret, openKfId, toUser,
+    msgtype: "voice",
+    content: { voice: { media_id: mediaId } },
+  });
+}
+
+// KF 视频发送
+async function sendKfVideo({ corpId, kfSecret, openKfId, toUser, mediaId }) {
+  return sendKfMessage({
+    corpId, kfSecret, openKfId, toUser,
+    msgtype: "video",
+    content: { video: { media_id: mediaId } },
+  });
+}
+
+// KF 文件发送
+async function sendKfFile({ corpId, kfSecret, openKfId, toUser, mediaId }) {
+  return sendKfMessage({
+    corpId, kfSecret, openKfId, toUser,
+    msgtype: "file",
+    content: { file: { media_id: mediaId } },
+  });
+}
+
+// KF 链接发送
+async function sendKfLink({ corpId, kfSecret, openKfId, toUser, title, desc, url, thumbMediaId }) {
+  return sendKfMessage({
+    corpId, kfSecret, openKfId, toUser,
+    msgtype: "link",
+    content: { link: { title, desc, url, thumb_media_id: thumbMediaId } },
+  });
+}
+
+// KF 小程序发送
+async function sendKfMiniprogram({ corpId, kfSecret, openKfId, toUser, appid, title, thumbMediaId, pagepath }) {
+  return sendKfMessage({
+    corpId, kfSecret, openKfId, toUser,
+    msgtype: "miniprogram",
+    content: { miniprogram: { appid, title, thumb_media_id: thumbMediaId, pagepath } },
+  });
+}
+
+// KF 菜单消息发送
+async function sendKfMsgmenu({ corpId, kfSecret, openKfId, toUser, headContent, list, tailContent }) {
+  return sendKfMessage({
+    corpId, kfSecret, openKfId, toUser,
+    msgtype: "msgmenu",
+    content: { msgmenu: { head_content: headContent, list, tail_content: tailContent } },
+  });
+}
+
+// KF 位置消息发送
+async function sendKfLocation({ corpId, kfSecret, openKfId, toUser, latitude, longitude, name, address }) {
+  return sendKfMessage({
+    corpId, kfSecret, openKfId, toUser,
+    msgtype: "location",
+    content: { location: { latitude, longitude, name, address } },
+  });
+}
+
+// KF 命令处理
+async function handleKfCommand({ api, config, openKfId, externalUserId, commandKey }) {
+  const { corpId, kfSecret } = config;
+
+  if (commandKey === "/help") {
+    await sendKfText({
+      corpId, kfSecret, openKfId, toUser: externalUserId,
+      text: `🤖 AI 客服助手使用帮助\n\n可用命令：\n/help - 显示此帮助信息\n/clear - 清除会话历史\n/status - 查看系统状态\n\n直接发送消息即可与 AI 对话。\n支持发送图片，AI 会分析图片内容。`,
+    });
+  } else if (commandKey === "/clear") {
+    const sessionId = `wecom-kf:${openKfId}:${externalUserId}`.toLowerCase();
+    try {
+      await execFileAsync("clawdbot", ["session", "clear", "--session-id", sessionId], { timeout: 10000 });
+      await sendKfText({ corpId, kfSecret, openKfId, toUser: externalUserId, text: "✅ 会话已清除，我们可以开始新的对话了！" });
+    } catch {
+      await sendKfText({ corpId, kfSecret, openKfId, toUser: externalUserId, text: "会话已重置，请开始新的对话。" });
+    }
+  } else if (commandKey === "/status") {
+    await sendKfText({
+      corpId, kfSecret, openKfId, toUser: externalUserId,
+      text: `📊 系统状态\n\n渠道：微信客服 (WeCom KF)\n会话ID：wecom-kf:${openKfId}:${externalUserId}\n客服账号：${openKfId}\n插件版本：0.4.0\n\n功能状态：\n✅ 文本消息\n✅ 图片发送/接收\n✅ 消息分段 (2048字符)\n✅ 命令系统\n✅ Markdown 转换\n✅ API 限流`,
+    });
+  }
+}
+
+// KF 入站消息处理
+async function processKfInboundMessage({ api, config, msg, openKfId }) {
+  const { corpId, kfSecret } = config;
+  const kfCacheKey = `${corpId}:kf`;
+  const externalUserId = msg.external_userid;
+  const msgType = msg.msgtype;
+  const sessionId = `wecom-kf:${openKfId}:${externalUserId}`.toLowerCase();
+
+  api.logger.info?.(`wecom-kf: processing ${msgType} from ${externalUserId} in session ${sessionId}`);
+
+  let messageText = "";
+  let imageTempPath = null;
+
+  try {
+    // 消息类型处理
+    switch (msgType) {
+      case "text":
+        messageText = msg.text?.content || "";
+        break;
+
+      case "image":
+        if (msg.image?.media_id) {
+          try {
+            const { buffer, contentType } = await downloadWecomMedia({ corpId, corpSecret: kfSecret, mediaId: msg.image.media_id, cacheKey: kfCacheKey });
+            const ext = (contentType || "").includes("png") ? "png" : "jpg";
+            const tempDir = join(tmpdir(), "clawdbot-wecom-kf");
+            await mkdir(tempDir, { recursive: true });
+            imageTempPath = join(tempDir, `image-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`);
+            await writeFile(imageTempPath, buffer);
+            messageText = `[客户发送了一张图片，已保存到: ${imageTempPath}]\n\n请使用 Read 工具查看这张图片并描述内容。`;
+          } catch (err) {
+            api.logger.warn?.(`wecom-kf: failed to download image: ${err.message}`);
+            messageText = "[客户发送了一张图片，但下载失败]\n\n请告诉客户图片处理暂时不可用。";
+          }
+        }
+        break;
+
+      case "voice":
+        if (msg.voice?.media_id) {
+          messageText = "[客户发送了一条语音消息]\n\n请告诉客户目前暂不支持语音消息，建议发送文字消息。";
+        }
+        break;
+
+      case "video":
+        if (msg.video?.media_id) {
+          try {
+            const { buffer } = await downloadWecomMedia({ corpId, corpSecret: kfSecret, mediaId: msg.video.media_id, cacheKey: kfCacheKey });
+            const tempDir = join(tmpdir(), "clawdbot-wecom-kf");
+            await mkdir(tempDir, { recursive: true });
+            const videoPath = join(tempDir, `video-${Date.now()}-${Math.random().toString(36).slice(2)}.mp4`);
+            await writeFile(videoPath, buffer);
+            messageText = `[客户发送了一个视频文件，已保存到: ${videoPath}]\n\n请告知客户您已收到视频。`;
+          } catch (err) {
+            api.logger.warn?.(`wecom-kf: failed to download video: ${err.message}`);
+            messageText = "[客户发送了一个视频，但下载失败]\n\n请告诉客户视频处理暂时不可用。";
+          }
+        }
+        break;
+
+      case "file":
+        if (msg.file?.media_id) {
+          try {
+            const { buffer } = await downloadWecomMedia({ corpId, corpSecret: kfSecret, mediaId: msg.file.media_id, cacheKey: kfCacheKey });
+            const fileName = msg.file.file_name || `file-${Date.now()}.bin`;
+            const tempDir = join(tmpdir(), "clawdbot-wecom-kf");
+            await mkdir(tempDir, { recursive: true });
+            const filePath = join(tempDir, `${Date.now()}-${fileName}`);
+            await writeFile(filePath, buffer);
+            const readableTypes = [".txt", ".md", ".json", ".xml", ".csv", ".log", ".pdf"];
+            const isReadable = readableTypes.some(t => fileName.toLowerCase().endsWith(t));
+            messageText = isReadable
+              ? `[客户发送了一个文件: ${fileName}，已保存到: ${filePath}]\n\n请使用 Read 工具查看这个文件的内容。`
+              : `[客户发送了一个文件: ${fileName}，大小: ${msg.file.file_size || buffer.length} 字节，已保存到: ${filePath}]\n\n请告知客户您已收到文件。`;
+          } catch (err) {
+            api.logger.warn?.(`wecom-kf: failed to download file: ${err.message}`);
+            messageText = `[客户发送了一个文件${msg.file?.file_name ? `: ${msg.file.file_name}` : ""}，但下载失败]\n\n请告诉客户文件处理暂时不可用。`;
+          }
+        }
+        break;
+
+      case "link":
+        messageText = `[客户分享了一个链接]\n标题: ${msg.link?.title || "(无标题)"}\n描述: ${msg.link?.desc || "(无描述)"}\n链接: ${msg.link?.url || "(无链接)"}\n\n请根据链接内容回复客户。如需要，可以使用 WebFetch 工具获取链接内容。`;
+        break;
+
+      case "location":
+        messageText = `[客户发送了位置]\n名称: ${msg.location?.name || ""}\n地址: ${msg.location?.address || ""}\n经纬度: ${msg.location?.latitude},${msg.location?.longitude}`;
+        break;
+
+      case "business_card":
+        messageText = `[客户发送了名片: ${msg.business_card?.userid || "unknown"}]`;
+        break;
+
+      case "miniprogram":
+        messageText = `[客户发送了小程序]\n标题: ${msg.miniprogram?.title || ""}\nAppId: ${msg.miniprogram?.appid || ""}`;
+        break;
+
+      case "msgmenu":
+        messageText = msg.msgmenu?.head_content || "[客户点击了菜单]";
+        break;
+
+      case "channels_shop_product":
+        messageText = `[客户发送了视频号商品]\n商品ID: ${msg.channels_shop_product?.product_id || ""}`;
+        break;
+
+      case "channels_shop_order":
+        messageText = `[客户发送了视频号订单]\n订单ID: ${msg.channels_shop_order?.order_id || ""}`;
+        break;
+
+      case "merged_msg":
+        messageText = "[客户发送了合并转发消息]";
+        break;
+
+      default:
+        api.logger.info?.(`wecom-kf: ignoring unsupported message type=${msgType}`);
+        return;
+    }
+
+    // 命令处理
+    if (msgType === "text" && messageText.startsWith("/")) {
+      const commandKey = messageText.split(/\s+/)[0].toLowerCase();
+      if (COMMANDS[commandKey]) {
+        await handleKfCommand({ api, config, openKfId, externalUserId, commandKey });
+        return;
+      }
+    }
+
+    if (!messageText) return;
+
+    // AI 调度（复用现有 runtime API）
+    const cfg = api.config;
+    const runtime = api.runtime;
+
+    const route = runtime.channel.routing.resolveAgentRoute({
+      cfg,
+      sessionKey: sessionId,
+      channel: "wecom-kf",
+      accountId: "kf-default",
+    });
+
+    const storePath = runtime.channel.session.resolveStorePath(cfg.session?.store, {
+      agentId: route.agentId,
+    });
+
+    const envelopeOptions = runtime.channel.reply.resolveEnvelopeFormatOptions(cfg);
+    const body = runtime.channel.reply.formatInboundEnvelope({
+      channel: "WeCom-KF",
+      from: externalUserId,
+      timestamp: msg.send_time * 1000,
+      body: messageText,
+      chatType: "direct",
+      sender: { name: externalUserId, id: externalUserId },
+      ...envelopeOptions,
+    });
+
+    const ctxPayload = {
+      Body: body,
+      RawBody: messageText,
+      From: `wecom-kf:${openKfId}:${externalUserId}`,
+      To: `wecom-kf:${externalUserId}`,
+      SessionKey: sessionId,
+      AccountId: "kf-default",
+      ChatType: "direct",
+      ConversationLabel: externalUserId,
+      SenderName: externalUserId,
+      SenderId: externalUserId,
+      Provider: "wecom-kf",
+      Surface: "wecom-kf",
+      MessageSid: `wecom-kf-${msg.msgid}`,
+      Timestamp: msg.send_time * 1000,
+      OriginatingChannel: "wecom-kf",
+      OriginatingTo: `wecom-kf:${externalUserId}`,
+    };
+
+    await runtime.channel.session.recordInboundSession({
+      storePath,
+      sessionKey: sessionId,
+      ctx: ctxPayload,
+      updateLastRoute: {
+        sessionKey: sessionId,
+        channel: "wecom-kf",
+        to: externalUserId,
+        accountId: "kf-default",
+      },
+      onRecordError: (err) => api.logger.warn?.(`wecom-kf: session record error: ${err}`),
+    });
+
+    runtime.channel.activity.record({
+      channel: "wecom-kf",
+      accountId: "kf-default",
+      direction: "inbound",
+    });
+
+    await writeToTranscript({ sessionKey: sessionId, role: "user", text: messageText, logger: api.logger });
+    broadcastToChatUI({ sessionKey: sessionId, role: "user", text: messageText, runId: `wecom-kf-in-${Date.now()}`, state: "final" });
+
+    const outboundRunId = `wecom-kf-out-${Date.now()}`;
+    await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg,
+      dispatcherOptions: {
+        deliver: async (payload, info) => {
+          if (payload.text) {
+            const formattedReply = markdownToWecomText(payload.text);
+            await sendKfText({
+              corpId, kfSecret, openKfId, toUser: externalUserId,
+              text: formattedReply, logger: api.logger,
+            });
+
+            await writeToTranscript({ sessionKey: sessionId, role: "assistant", text: payload.text, logger: api.logger });
+            broadcastToChatUI({
+              sessionKey: sessionId, role: "assistant", text: payload.text,
+              runId: outboundRunId, state: info.kind === "final" ? "final" : "streaming",
+            });
+          }
+        },
+        onError: (err, info) => {
+          api.logger.error?.(`wecom-kf: ${info.kind} reply failed: ${String(err)}`);
+        },
+      },
+      replyOptions: { disableBlockStreaming: true },
+    });
+  } catch (err) {
+    api.logger.error?.(`wecom-kf: failed to process message: ${err.message}`);
+    api.logger.error?.(`wecom-kf: stack trace: ${err.stack}`);
+
+    try {
+      await sendKfText({
+        corpId, kfSecret, openKfId, toUser: externalUserId,
+        text: `抱歉，处理您的消息时出现错误，请稍后重试。\n错误: ${err.message?.slice(0, 100) || "未知错误"}`,
+        logger: api.logger,
+      });
+    } catch (sendErr) {
+      api.logger.error?.(`wecom-kf: failed to send error message: ${sendErr.message}`);
+    }
+  } finally {
+    if (imageTempPath) {
+      unlink(imageTempPath).catch(() => {});
+    }
+  }
+}
+
 export default function register(api) {
   // 保存 runtime 引用
   gatewayRuntime = api.runtime;
@@ -960,11 +1253,88 @@ export default function register(api) {
   });
 
   api.logger.info?.(`wecom: registered webhook at ${normalizedPath}`);
+
+  // ============================================================
+  // 微信客服 (KF) 回调注册
+  // gateway 已处理 sync_msg 拉取，直接推送原始 JSON 消息到此路由
+  // ============================================================
+  const kfCfg = getWecomKfConfig(api);
+  if (kfCfg?.enabled) {
+    const kfWebhookPath = kfCfg.webhookPath || "/wecom/kf/callback";
+    const normalizedKfPath = normalizePluginHttpPath(kfWebhookPath, "/wecom/kf/callback") ?? "/wecom/kf/callback";
+
+    api.registerHttpRoute({
+      path: normalizedKfPath,
+      handler: async (req, res) => {
+        const config = getWecomKfConfig(api);
+
+        // Health check
+        if (req.method === "GET") {
+          res.statusCode = config ? 200 : 500;
+          res.setHeader("Content-Type", "text/plain; charset=utf-8");
+          res.end(config ? "wecom kf webhook ok" : "wecom kf webhook not configured");
+          return;
+        }
+
+        if (req.method !== "POST") {
+          res.statusCode = 405;
+          res.setHeader("Allow", "GET, POST");
+          res.end();
+          return;
+        }
+
+        if (!config) {
+          res.statusCode = 500;
+          res.setHeader("Content-Type", "text/plain; charset=utf-8");
+          res.end("WeCom KF not configured");
+          return;
+        }
+
+        // 读取 gateway 推送的 sync_msg 原始 JSON 数据
+        const rawBody = await readRequestBody(req);
+        let msg;
+        try {
+          msg = JSON.parse(rawBody);
+        } catch (parseErr) {
+          res.statusCode = 400;
+          res.setHeader("Content-Type", "text/plain; charset=utf-8");
+          res.end("Invalid JSON");
+          return;
+        }
+
+        // 立即 ACK
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ errcode: 0, errmsg: "ok" }));
+
+        const openKfId = msg.open_kfid || config.openKfId;
+
+        api.logger.info?.(
+          `wecom-kf inbound: external_userid=${msg.external_userid} msgtype=${msg.msgtype} open_kfid=${openKfId}`
+        );
+
+        // 仅处理客户消息 (origin=3)，忽略系统消息和客服消息
+        if (msg.origin !== undefined && msg.origin !== 3) {
+          api.logger.info?.(`wecom-kf: ignoring non-customer message origin=${msg.origin}`);
+          return;
+        }
+
+        // 异步处理消息
+        processKfInboundMessage({ api, config, msg, openKfId }).catch(err => {
+          api.logger.error?.(`wecom-kf: message processing failed: ${err.message}`);
+        });
+      },
+    });
+
+    api.logger.info?.(`wecom-kf: registered webhook at ${normalizedKfPath} (openKfId=${kfCfg.openKfId})`);
+  } else {
+    api.logger.info?.("wecom-kf: customer service API not configured or disabled");
+  }
 }
 
 // 下载企业微信媒体文件
-async function downloadWecomMedia({ corpId, corpSecret, mediaId }) {
-  const accessToken = await getWecomAccessToken({ corpId, corpSecret });
+async function downloadWecomMedia({ corpId, corpSecret, mediaId, cacheKey }) {
+  const accessToken = await getWecomAccessToken({ corpId, corpSecret, cacheKey });
   const mediaUrl = `https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token=${encodeURIComponent(accessToken)}&media_id=${encodeURIComponent(mediaId)}`;
 
   const res = await fetch(mediaUrl);
@@ -1033,7 +1403,7 @@ async function handleStatusCommand({ api, fromUser, corpId, corpSecret, agentId 
 会话ID：wecom:${fromUser}
 账户ID：${config?.accountId || "default"}
 已配置账户：${accountIds.join(", ")}
-插件版本：0.3.0
+插件版本：0.4.0
 
 功能状态：
 ✅ 文本消息

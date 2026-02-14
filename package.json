@@ -1,26 +1,39 @@
 {
   "name": "@mijia-life/clawdbot-wecom",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
-  "description": "WeCom (企业微信) channel plugin for Clawdbot (internal apps).",
+  "description": "WeCom (企业微信) channel plugin for Clawdbot (internal apps + customer service).",
   "license": "MIT",
   "exports": "./src/index.js",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
   "clawdbot": {
-    "extensions": ["./src/index.js"],
+    "extensions": [
+      "./src/index.js"
+    ],
     "channel": {
       "id": "wecom",
       "label": "WeCom",
-      "selectionLabel": "WeCom (企业微信自建应用)",
+      "selectionLabel": "WeCom (企业微信自建应用 + 微信客服)",
       "docsPath": "/channels/wecom",
       "docsLabel": "wecom",
-      "blurb": "Enterprise WeChat internal app via callback + send API.",
+      "blurb": "Enterprise WeChat internal app + customer service via callback + send API.",
       "order": 80,
-      "aliases": ["wework", "qiwei", "wxwork"]
+      "aliases": [
+        "wework",
+        "qiwei",
+        "wxwork"
+      ]
     }
   },
   "dependencies": {
     "clawdbot": "*",
     "fast-xml-parser": "^4.3.6"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
   }
 }
