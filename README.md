@@ -43,8 +43,8 @@
 1. 克隆本仓库：
 
 ```bash
-git clone https://github.com/anthropics/clawdbot-wecom.git
-cd clawdbot-wecom
+git clone https://github.com/Clouditera/OpenClaw-Wechat.git
+cd OpenClaw-Wechat
 npm install
 ```
 
