@@ -1,14 +1,38 @@
 {
-  "name": "@mijia-life/clawdbot-wecom",
+  "name": "@clouditera/openclaw-wechat",
   "version": "0.4.0",
-  "private": true,
   "type": "module",
   "description": "WeCom (企业微信) channel plugin for Clawdbot (internal apps + customer service).",
   "license": "MIT",
   "exports": "./src/index.js",
+  "files": [
+    "src/",
+    "clawdbot.plugin.json",
+    "docs/",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Clouditera/OpenClaw-Wechat.git"
+  },
+  "homepage": "https://github.com/Clouditera/OpenClaw-Wechat#readme",
+  "bugs": {
+    "url": "https://github.com/Clouditera/OpenClaw-Wechat/issues"
+  },
+  "keywords": [
+    "clawdbot",
+    "wecom",
+    "wechat",
+    "enterprise-wechat",
+    "customer-service",
+    "chatbot"
+  ],
   "scripts": {
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "npm test"
   },
   "clawdbot": {
     "extensions": [
